@@ -398,3 +398,50 @@ class LowBalanceEventOut(BaseModel):
     threshold: float = Field(..., description="触发本事件时的低余额阈值")
     request_id: str = Field(..., description="触发本事件的裁决 request_id")
     created_at: str
+
+
+class RouteTransferIn(BaseModel):
+    transfer_id: str = Field(
+        ..., min_length=1,
+        description="移拨幂等键：相同编号 + 相同载荷重放原成功结果；同编号异载荷返回 409",
+    )
+    tenant_id: str = Field(..., min_length=1, description="同一租户 ID（必填）")
+    source_route_id: str = Field(..., min_length=1, description="源路由 ID（扣出令牌的路由桶）")
+    target_route_id: str = Field(..., min_length=1, description="目标路由 ID（增入令牌的路由桶）")
+    amount: float = Field(..., description="移拨令牌数（正数、有限）；源桶补充后不足或目标桶补充后加数量超容量时 409")
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _amount_must_be_positive_finite(cls, v):
+        # gt=0 无法拒绝 NaN（NaN 比较恒为假）；非有限浮点在此显式拒绝为 422。
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("amount 必须是正数")
+        f = float(v)
+        if not math.isfinite(f):
+            raise ValueError("amount 必须是有限数（不接受 NaN / Infinity）")
+        if f <= 0:
+            raise ValueError("amount 必须为正数")
+        return f
+
+    @field_validator("target_route_id")
+    @classmethod
+    def _routes_must_differ(cls, v, info):
+        # 同一路由的「移拨」没有意义，在入参层明确报 422（quota 层另有防御性校验）
+        source = info.data.get("source_route_id")
+        if source is not None and v == source:
+            raise ValueError("source_route_id 与 target_route_id 必须是不同路由")
+        return v
+
+
+class RouteTransferOut(BaseModel):
+    transfer_id: str
+    tenant_id: str
+    source_route_id: str
+    target_route_id: str
+    amount: float
+    transferred_at: str = Field(..., description="移拨时刻（ISO 8601 UTC）")
+    source_bucket: BucketOut = Field(..., description="源路由桶移拨（补充后扣 amount）后的余额")
+    target_bucket: BucketOut = Field(..., description="目标路由桶移拨（补充后增 amount）后的余额")
+    replayed: bool = Field(
+        ..., description="是否为相同 transfer_id + 相同载荷的重放（重放不再次扣增）"
+    )

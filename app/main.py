@@ -5,8 +5,8 @@
 并发裁决不会超发（见 app/database.py 与 app/quota.py）。
 
 管理写接口（PUT /policies、POST /policies/rollback、POST /policy-changes、
-DELETE /policy-changes/{change_id}）需要 HMAC-SHA256 防重放签名
-（X-Key-Id/X-Timestamp/X-Nonce/X-Signature，见 app/auth.py）；
+DELETE /policy-changes/{change_id}、POST /route-transfers）需要 HMAC-SHA256
+防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature，见 app/auth.py）；
 所有 GET、POST /decide、POST /decide-batches 裁决与撤销、
 POST /policies/impact-preview 预演、POST /reservations 预占
 （含确认/取消/结算/查询）与 POST /quota-plans 配额规划接口保持匿名可用。
@@ -49,6 +49,8 @@ from .schemas import (
     ReservationOut,
     ReservationSettleIn,
     RevokeOut,
+    RouteTransferIn,
+    RouteTransferOut,
 )
 
 
@@ -85,11 +87,16 @@ app = FastAPI(
         "时间筛选）按 tenant_id、route_id 汇总已消耗量（获准未撤销裁决、confirmed/"
         "settled 预占）与未完成占用量（报表时刻尚未到期的 pending 预占；到期未清扫"
         "也按到期处理），不修改预占或桶。"
-        "管理写接口（策略新增/更新、回滚、定时变更创建/取消）需要"
+        "POST /route-transfers 在同一租户两个不同路由桶之间移拨现有令牌（管理写）："
+        "先在独立前序写事务应用两侧到期策略切换并清扫全部到期预占返还（到期优先，"
+        "随后 409 也已持久化），业务事务内把两桶补充到同一时刻（未建桶按满额），"
+        "源足且目标加量不超容量才只扣源桶、增目标桶（不碰全局/租户桶，不产裁决与"
+        "事件）；transfer_id 对完整载荷幂等：同键同载荷重放原结果、异载荷 409。"
+        "管理写接口（策略新增/更新、回滚、定时变更创建/取消、路由桶移拨）需要"
         " HMAC-SHA256 防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature）；"
         "GET、裁决（含批量）、预演、撤销、预占、配额规划与配额消耗核对接口无需认证。"
     ),
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -686,3 +693,58 @@ def get_quota_usage(
         )
     with read_tx(conn):
         return quota.quota_usage(conn, start=start_dt, end=end_dt)
+
+
+# ------------------------------------------------------------ 路由桶移拨
+
+
+@app.post(
+    "/route-transfers",
+    response_model=RouteTransferOut,
+    tags=["路由桶移拨"],
+    responses={
+        401: {"description": "缺少/无效的 HMAC 签名，或时间戳偏离超过 300 秒"},
+        404: {"description": "源路由或目标路由的 route 策略未配置"},
+        409: {"description": "transfer_id 已存在但载荷冲突；或源桶余额不足；或目标桶加数量后超容量"},
+        422: {"description": "amount 非正数/NaN/Infinity、source 与 target 相同路由等"},
+        503: {"description": "服务端未配置 ADMIN_KEY_ID / ADMIN_HMAC_SECRET"},
+    },
+)
+def post_route_transfer(
+    body: RouteTransferIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+    admin: AdminPrincipal = Depends(require_admin),
+) -> dict:
+    """在同一租户的两个**不同**路由配额桶之间移拨现有令牌（管理写接口，需签名）。
+
+    分两个串行写事务（同一连接），与结算的「到期优先」同一模式：
+      1. 先在独立前序写事务里应用两个路由策略键上已到期的定时切换，并把全部
+         到期 pending 预占转 expired 并返还，单独提交——即使随后移拨返回 409，
+         已到期的切换与返还也已持久化生效；
+      2. 业务事务沿用同一事务时刻：先登记 nonce，再按 transfer_id 查幂等存档，
+         随后把两个路由桶按各自当前策略补充到同一时刻（未创建的桶按容量满额）。
+         源补充后余额足够、且目标补充后余额加数量不超过容量时，才只扣源路由桶、
+         增目标路由桶（不扣全局/租户桶，不写裁决与低余额事件）；任一不满足返回
+         409、不执行扣增（业务事务回滚，nonce 不被占用）。
+    相同 transfer_id + 相同载荷（tenant/source/target/amount）重放原成功结果
+    （replayed=true，不再次扣增）；同编号异载荷返回 409。
+    """
+    with write_tx(conn):
+        ts = quota.prepare_route_transfer(
+            conn,
+            tenant_id=body.tenant_id,
+            source_route_id=body.source_route_id,
+            target_route_id=body.target_route_id,
+            amount=body.amount,
+        )
+    with write_tx(conn):
+        reserve_nonce(conn, admin.key_id, admin.nonce)
+        return quota.route_transfer(
+            conn,
+            transfer_id=body.transfer_id,
+            tenant_id=body.tenant_id,
+            source_route_id=body.source_route_id,
+            target_route_id=body.target_route_id,
+            amount=body.amount,
+            now=ts,
+        )

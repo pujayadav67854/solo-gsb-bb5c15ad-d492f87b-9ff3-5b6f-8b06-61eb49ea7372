@@ -204,6 +204,23 @@ CREATE TABLE IF NOT EXISTS admin_nonces (
 CREATE INDEX IF NOT EXISTS idx_admin_nonces_expires
 ON admin_nonces (expires_at);
 
+-- 路由桶移拨（route transfer）：同一租户两个不同路由桶之间移拨现有令牌。
+-- 仅成功的移拨打点存档（冲突 409 不存档，可在余额变化后重试）：
+-- transfer_id 与规范载荷（tenant/source/target/amount 的 SHA-256）一一对应，
+-- 同键同载荷重放原成功结果（replayed=true，不再次扣增），同键异载荷 409。
+-- 移拨只改两个 route 桶：不扣全局/租户桶，不写 decisions 与 low_balance_events。
+CREATE TABLE IF NOT EXISTS route_transfers (
+    transfer_id    TEXT PRIMARY KEY,
+    payload_hash   TEXT NOT NULL,
+    payload_json   TEXT NOT NULL,
+    tenant_id      TEXT NOT NULL,
+    source_route   TEXT NOT NULL,
+    target_route   TEXT NOT NULL,
+    amount         REAL NOT NULL CHECK (amount > 0),
+    transferred_at TEXT NOT NULL,
+    result_json    TEXT NOT NULL
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

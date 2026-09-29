@@ -3520,3 +3520,466 @@ def test_usage_settled_actual_cost_counts_not_reserved_cost(client, clock):
     assert g["consumed"] == 8.0
     assert g["settled_count"] == 2
     assert g["held"] == 0.0
+
+
+# ============================================================ 路由桶移拨
+
+
+def _route_transfer(client, transfer_id, tenant, source, target, amount,
+                    **sign_kwargs):
+    return admin_call(
+        client,
+        "POST",
+        "/route-transfers",
+        {
+            "transfer_id": transfer_id,
+            "tenant_id": tenant,
+            "source_route_id": source,
+            "target_route_id": target,
+            "amount": amount,
+        },
+        **sign_kwargs,
+    )
+
+
+def _route_bucket(client, tenant, route):
+    rows = client.get("/buckets").json()
+    return next(
+        b for b in rows
+        if b["scope"] == "route" and b["tenant_id"] == tenant
+        and b["route_id"] == route
+    )
+
+
+def test_route_transfer_moves_tokens_between_route_buckets(client):
+    # 源容量 10、目标容量 10；先在源桶花掉 6（余额 4），目标桶花掉 8（余额 2）
+    put_policy(client, "global", 100, 0)
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-b")
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-a", "cost": 6})
+    client.post("/decide", json={
+        "request_id": "d2", "tenant_id": "acme", "route_id": "r-b", "cost": 8})
+
+    r = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 3)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["transfer_id"] == "tr-1"
+    assert body["tenant_id"] == "acme"
+    assert body["source_route_id"] == "r-a"
+    assert body["target_route_id"] == "r-b"
+    assert body["amount"] == 3.0
+    assert body["replayed"] is False
+    assert body["source_bucket"]["scope"] == "route"
+    assert body["source_bucket"]["balance"] == 1.0
+    assert body["target_bucket"]["balance"] == 5.0
+    assert "transferred_at" in body and body["transferred_at"].endswith("Z")
+
+    # 实际桶余额与响应一致
+    assert _route_bucket(client, "acme", "r-a")["balance"] == 1.0
+    assert _route_bucket(client, "acme", "r-b")["balance"] == 5.0
+
+
+def test_route_transfer_does_not_touch_global_or_tenant_buckets(client):
+    put_policy(client, "global", 100, 0)
+    put_policy(client, "tenant", 50, 0, tenant="acme")
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-b")
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-a", "cost": 6})
+    client.post("/decide", json={
+        "request_id": "d2", "tenant_id": "acme", "route_id": "r-b", "cost": 8})
+
+    rows = { (b["scope"], b["tenant_id"], b["route_id"]): b["balance"]
+             for b in client.get("/buckets").json() }
+    assert rows[("global", None, None)] == 86.0
+    assert rows[("tenant", "acme", None)] == 36.0
+
+    r = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 2)
+    assert r.status_code == 200
+    rows = { (b["scope"], b["tenant_id"], b["route_id"]): b["balance"]
+             for b in client.get("/buckets").json() }
+    # 全局/租户桶不再变动；仅两个路由桶一减一增
+    assert rows[("global", None, None)] == 86.0
+    assert rows[("tenant", "acme", None)] == 36.0
+    assert rows[("route", "acme", "r-a")] == 2.0
+    assert rows[("route", "acme", "r-b")] == 4.0
+
+
+def test_route_transfer_uncreated_buckets_treated_as_full(client):
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 4, 0, tenant="acme", route="r-b")
+    # 两个桶都从未惰性创建：源按满额 10；目标按满额 4，满额 + 任何正数都超容量
+    r = _route_transfer(client, "tr-full", "acme", "r-a", "r-b", 1)
+    assert r.status_code == 409
+    assert "超过容量" in r.json()["detail"]
+
+    # 给目标腾出空间（裁决惰性建桶，r-b 余额 4-2=2）；源 r-a 仍未建桶按满额 10
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-b", "cost": 2})
+    # 源满额扣 3 -> 7（本次建桶），目标 2 + 3 = 5 超容量 4 -> 仍冲突
+    over = _route_transfer(client, "tr-over", "acme", "r-a", "r-b", 3)
+    assert over.status_code == 409
+    # 移 2：源 10-2=8，目标 2+2=4 恰好到容量；两桶落库
+    ok = _route_transfer(client, "tr-ok", "acme", "r-a", "r-b", 2)
+    assert ok.status_code == 200
+    assert ok.json()["source_bucket"]["balance"] == 8.0
+    assert ok.json()["target_bucket"]["balance"] == 4.0
+    assert _route_bucket(client, "acme", "r-a")["balance"] == 8.0
+    assert _route_bucket(client, "acme", "r-b")["balance"] == 4.0
+
+
+def test_route_transfer_insufficient_source_conflicts_and_moves_nothing(client):
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-b")
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-a", "cost": 8})
+    client.post("/decide", json={
+        "request_id": "d2", "tenant_id": "acme", "route_id": "r-b", "cost": 5})
+    # 源余额 2 < 3 -> 409（即使目标余额 5 有空间）
+    r = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 3)
+    assert r.status_code == 409
+    assert "不足" in r.json()["detail"]
+    # 两个桶都不变
+    assert _route_bucket(client, "acme", "r-a")["balance"] == 2.0
+    assert _route_bucket(client, "acme", "r-b")["balance"] == 5.0
+    # 冲突不存档：用同一编号同载荷重试移 2 可以成功
+    r2 = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 2)
+    assert r2.status_code == 200
+    assert r2.json()["source_bucket"]["balance"] == 0.0
+    assert r2.json()["target_bucket"]["balance"] == 7.0
+
+
+def test_route_transfer_target_overflow_conflicts_and_moves_nothing(client):
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 5, 0, tenant="acme", route="r-b")
+    # 源花掉 1（余额 9，同时惰性建桶），目标花掉 2（余额 3）
+    client.post("/decide", json={
+        "request_id": "d0", "tenant_id": "acme", "route_id": "r-a", "cost": 1})
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-b", "cost": 2})
+    # 目标余额 3，容量 5，+3 = 6 超容量 -> 409；源保持 9
+    r = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 3)
+    assert r.status_code == 409
+    assert "超过容量" in r.json()["detail"]
+    assert _route_bucket(client, "acme", "r-a")["balance"] == 9.0
+    assert _route_bucket(client, "acme", "r-b")["balance"] == 3.0
+    # +2 恰好到容量边界：成功；源 9-2=7
+    ok = _route_transfer(client, "tr-2", "acme", "r-a", "r-b", 2)
+    assert ok.status_code == 200
+    assert ok.json()["target_bucket"]["balance"] == 5.0
+    assert ok.json()["source_bucket"]["balance"] == 7.0
+
+
+def test_route_transfer_replay_same_payload_does_not_move_again(client):
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-b")
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-b", "cost": 5})
+    r1 = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 3)
+    assert r1.status_code == 200
+    first = r1.json()
+    assert first["replayed"] is False
+    assert first["transferred_at"]
+
+    # 相同编号 + 相同载荷（即使换 nonce/时间戳）：重放原结果，不再次扣增
+    r2 = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 3)
+    assert r2.status_code == 200
+    again = r2.json()
+    assert again["replayed"] is True
+    assert again["transferred_at"] == first["transferred_at"]
+    assert again["source_bucket"]["balance"] == first["source_bucket"]["balance"]
+    assert again["target_bucket"]["balance"] == first["target_bucket"]["balance"]
+    assert _route_bucket(client, "acme", "r-a")["balance"] == 7.0
+    assert _route_bucket(client, "acme", "r-b")["balance"] == 8.0
+
+
+def test_route_transfer_same_id_divergent_payload_conflicts(client):
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-b")
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-c")
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-b", "cost": 5})
+    client.post("/decide", json={
+        "request_id": "d2", "tenant_id": "acme", "route_id": "r-c", "cost": 5})
+    assert _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 3).status_code == 200
+
+    # 改数量
+    r = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 4)
+    assert r.status_code == 409 and "载荷不一致" in r.json()["detail"]
+    # 改源/目标/租户
+    assert _route_transfer(client, "tr-1", "acme", "r-a", "r-c", 3).status_code == 409
+    assert _route_transfer(client, "tr-1", "acme", "r-c", "r-b", 3).status_code == 409
+    assert _route_transfer(client, "tr-1", "other", "r-a", "r-b", 3).status_code == 409
+    # 原移拨未被二次执行
+    assert _route_bucket(client, "acme", "r-a")["balance"] == 7.0
+    assert _route_bucket(client, "acme", "r-b")["balance"] == 8.0
+
+
+def test_route_transfer_validation_errors(client):
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-b")
+
+    def _raw(body):
+        return admin_call(
+            client, "POST", "/route-transfers", raw_body=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+    # 相同路由（schema 层 422）
+    same = json.dumps({"transfer_id": "t", "tenant_id": "acme",
+                       "source_route_id": "r-a", "target_route_id": "r-a",
+                       "amount": 1}).encode()
+    assert _raw(same).status_code == 422
+    # 非正数量 / 零（Pydantic gt=0 本身拦不住 NaN，需显式拒绝）
+    cases = [
+        {"transfer_id": "t", "tenant_id": "acme", "source_route_id": "r-a",
+         "target_route_id": "r-b", "amount": 0},
+        {"transfer_id": "t", "tenant_id": "acme", "source_route_id": "r-a",
+         "target_route_id": "r-b", "amount": -2},
+    ]
+    for c in cases:
+        assert _raw(json.dumps(c).encode()).status_code == 422
+    # NaN / Infinity 显式 422
+    assert _raw(b'{"transfer_id":"t","tenant_id":"acme","source_route_id":"r-a",'
+                b'"target_route_id":"r-b","amount":NaN}').status_code == 422
+    assert _raw(b'{"transfer_id":"t","tenant_id":"acme","source_route_id":"r-a",'
+                b'"target_route_id":"r-b","amount":Infinity}').status_code == 422
+    # 空编号 -> 422（签名有效，Pydantic min_length 拦截）
+    assert _route_transfer(client, "", "acme", "r-a", "r-b", 1).status_code == 422
+    # 缺字段 -> 422
+    missing = admin_call(
+        client, "POST", "/route-transfers",
+        {"transfer_id": "t", "tenant_id": "acme", "source_route_id": "r-a"},
+    )
+    assert missing.status_code == 422
+
+
+def test_route_transfer_missing_route_policy_404(client):
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    # 只配了源，没有目标策略
+    r = _route_transfer(client, "tr-1", "acme", "r-a", "r-missing", 1)
+    assert r.status_code == 404 and "目标路由策略不存在" in r.json()["detail"]
+    # 两侧都没有
+    r2 = _route_transfer(client, "tr-2", "acme", "r-x", "r-y", 1)
+    assert r2.status_code == 404 and "源路由策略不存在" in r2.json()["detail"]
+    # 只配了全局/租户策略也不允许移拨路由桶
+    put_policy(client, "global", 100, 0)
+    put_policy(client, "tenant", 50, 0, tenant="acme")
+    r3 = _route_transfer(client, "tr-3", "acme", "r-a", "r-missing", 1)
+    assert r3.status_code == 404
+    # 404 业务失败不占用 nonce：同一 nonce 随后可成功（目标桶需先有空间）
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-b")
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-b", "cost": 3})
+    ok = _route_transfer(client, "tr-4", "acme", "r-a", "r-b", 1, nonce="n-404")
+    assert ok.status_code == 200
+
+
+def test_route_transfer_requires_admin_signature(client):
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-b")
+    # 先给目标桶腾出容量，否则满额桶加任何正数都会 409
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-b", "cost": 5})
+    # 不带签名头 -> 401（不是 404/422）
+    r = client.post("/route-transfers", json={
+        "transfer_id": "tr-1", "tenant_id": "acme",
+        "source_route_id": "r-a", "target_route_id": "r-b", "amount": 1})
+    assert r.status_code == 401
+    # 错误密钥 -> 401
+    bad = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 1,
+                          secret="wrong-secret")
+    assert bad.status_code == 401
+    # 正确签名成功
+    ok = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 1)
+    assert ok.status_code == 200
+
+
+def test_route_transfer_generates_no_decisions_or_events(client):
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a", threshold=2)
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-b")
+    # 目标先花掉 9 腾出容量（注意这次裁决不命中 r-a，阈值事件与 r-a 无关）
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-b", "cost": 9})
+    # 移拨把源桶从满额 10 扣到 1（越过其阈值 2），但移拨不产裁决/低余额事件
+    r = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 9)
+    assert r.status_code == 200
+    assert client.get("/events").json() == []
+    # /quota-usage 也不把移拨计为消耗（d1 命中的是 r-b 路由桶，计入其分组 9）
+    body = client.get("/quota-usage", params={
+        "start": "2020-01-01T00:00:00Z", "end": "2030-01-01T00:00:00Z"}).json()
+    groups = {(g["tenant_id"], g["route_id"]): g for g in body["groups"]}
+    assert groups[("acme", "r-b")]["consumed"] == 9.0
+    # 没有任何针对 r-a 的裁决消耗
+    assert ("acme", "r-a") not in groups
+
+
+def test_route_transfer_refills_both_buckets_to_same_instant(client, clock):
+    put_policy(client, "route", 10, 1, tenant="acme", route="r-a")
+    put_policy(client, "route", 10, 2, tenant="acme", route="r-b")
+    # 源花掉 8（余额 2），目标花掉 9（余额 1），同一 t0
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-a", "cost": 8})
+    client.post("/decide", json={
+        "request_id": "d2", "tenant_id": "acme", "route_id": "r-b", "cost": 9})
+    # 4 秒后：源补充到 6、目标补充到 9（1+4*2）；移 4 -> 源 2、目标 13 超容量
+    clock.advance(4)
+    r = _route_transfer(client, "tr-over", "acme", "r-a", "r-b", 4)
+    assert r.status_code == 409
+    # 再推进 1 秒（t=5）：源 7、目标 10（封顶）。给目标花掉 4（补充到 10 后扣 4 -> 6）
+    clock.advance(1)
+    client.post("/decide", json={
+        "request_id": "d3", "tenant_id": "acme", "route_id": "r-b", "cost": 4})
+    # 移 3：源 7-3=4，目标 6+3=9
+    ok = _route_transfer(client, "tr-ok", "acme", "r-a", "r-b", 3)
+    assert ok.status_code == 200
+    assert ok.json()["source_bucket"]["balance"] == 4.0
+    assert ok.json()["target_bucket"]["balance"] == 9.0
+    # 响应中的移拨时刻即两桶补充/落库的同一时刻
+    assert ok.json()["transferred_at"] == _iso(clock.t)
+
+
+def test_route_transfer_due_policy_changes_apply_before_move(client, clock):
+    # 源路由：容量 10 -> 20（未来 1 秒后生效），先花掉 5（剩余比例 0.5）
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 30, 0, tenant="acme", route="r-b")
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-a", "cost": 5})
+    # 目标桶先花掉 20，给移拨腾出容量（满额 30 时无法增入 8）
+    client.post("/decide", json={
+        "request_id": "d2", "tenant_id": "acme", "route_id": "r-b", "cost": 20})
+    # 用冻结时钟显式提交 1 秒后生效的变更（post_change 辅助用真实时间，
+    # 与本测试的冻结时钟不一致）
+    body = {
+        "change_id": "chg-a", "scope": "route",
+        "tenant_id": "acme", "route_id": "r-a",
+        "capacity": 20, "refill_rate": 0,
+        "effective_at": _iso(clock.t + timedelta(seconds=1)),
+    }
+    assert admin_call(client, "POST", "/policy-changes", body).status_code == 200
+
+    # 切换到期后移拨：源按剩余比例换算 5/10*20=10，再按新容量参与
+    clock.advance(2)
+    r = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 8)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["source_bucket"]["capacity"] == 20.0
+    assert body["source_bucket"]["balance"] == 2.0  # 10 - 8
+    assert body["target_bucket"]["balance"] == 18.0  # 10 + 8
+    # 变更已被本次移拨事务应用
+    changes = client.get("/policy-changes",
+                         params={"status": "applied"}).json()
+    assert any(c["change_id"] == "chg-a" for c in changes)
+
+
+def test_route_transfer_conflict_still_persists_due_effects(client, clock):
+    """409 不扣增，但前序事务的到期切换与到期预占返还仍生效（到期优先）。"""
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-b")
+    # 目标桶先花掉 1（余额 9 并惰性建桶），为后续移拨留出恰好 1 个令牌的空间
+    client.post("/decide", json={
+        "request_id": "d0", "tenant_id": "acme", "route_id": "r-b", "cost": 1})
+    # 源桶预占 9（余额 1），10 秒后到期应返还 -> 余额回到 10
+    _reserve(client, "rsv-a", 9, ttl=10, tenant="acme", route="r-a")
+    assert _route_bucket(client, "acme", "r-a")["balance"] == 1.0
+
+    # 目标余额 9、容量 10：移 2 会超容量 -> 409
+    clock.advance(11)
+    r = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 2)
+    assert r.status_code == 409
+    # 到期预占已在前序独立事务转 expired 并向源桶返还 9
+    assert _db_status("rsv-a") == "expired"
+    assert _route_bucket(client, "acme", "r-a")["balance"] == 10.0
+    # 未执行扣增：目标仍为 9
+    assert _route_bucket(client, "acme", "r-b")["balance"] == 9.0
+
+    # 到期的定时切换同样在 409 时生效：在当前冻结时刻提交 1 秒后生效的目标扩容
+    change_body = {
+        "change_id": "chg-b", "scope": "route",
+        "tenant_id": "acme", "route_id": "r-b",
+        "capacity": 20, "refill_rate": 0,
+        "effective_at": _iso(clock.t + timedelta(seconds=1)),
+    }
+    assert admin_call(
+        client, "POST", "/policy-changes", change_body).status_code == 200
+    clock.advance(1)
+    r2 = _route_transfer(client, "tr-2", "acme", "r-a", "r-b", 15)
+    # 源 10 < 15 -> 409，但目标策略已切换为容量 20
+    # （已有桶按比例 9/10*20=18 换算）
+    assert r2.status_code == 409
+    assert _route_bucket(client, "acme", "r-b")["capacity"] == 20.0
+    assert _route_bucket(client, "acme", "r-b")["balance"] == 18.0
+    changes = client.get("/policy-changes", params={"status": "applied"}).json()
+    assert any(c["change_id"] == "chg-b" for c in changes)
+
+    # 目标扩容换算后余额 18、容量 20，只剩 2 个令牌空间：源移 2 恰好成功
+    ok = _route_transfer(client, "tr-3", "acme", "r-a", "r-b", 2)
+    assert ok.status_code == 200
+    assert ok.json()["source_bucket"]["balance"] == 8.0
+    assert ok.json()["target_bucket"]["balance"] == 20.0
+
+
+def test_route_transfer_conflict_does_not_consume_nonce(client):
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-b")
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-a", "cost": 9})
+    client.post("/decide", json={
+        "request_id": "d2", "tenant_id": "acme", "route_id": "r-b", "cost": 5})
+    # 源余额 1，移 5 -> 409；业务事务回滚，nonce 不被占用
+    r = _route_transfer(client, "tr-1", "acme", "r-a", "r-b", 5, nonce="n-move")
+    assert r.status_code == 409
+    # 用同一 nonce 提交一笔可行移拨（源 1 足够、目标余 5 有空间）-> 成功
+    ok = _route_transfer(client, "tr-2", "acme", "r-a", "r-b", 1, nonce="n-move")
+    assert ok.status_code == 200
+    assert ok.json()["source_bucket"]["balance"] == 0.0
+    assert ok.json()["target_bucket"]["balance"] == 6.0
+
+
+def test_route_transfer_concurrent_never_overshoots(client):
+    put_policy(client, "route", 10, 0, tenant="acme", route="r-a")
+    put_policy(client, "route", 20, 0, tenant="acme", route="r-b")
+    # 目标先花掉 10（容量 20 -> 余额 10，腾出 10 个令牌的空间）
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "acme", "route_id": "r-b", "cost": 10})
+
+    results = []
+
+    def _move(i):
+        # 每笔尝试把 4 个令牌从 r-a 移到 r-b；源只有 10，仅够 2 笔
+        r = _route_transfer(client, f"tr-c-{i}", "acme", "r-a", "r-b", 4)
+        results.append(r.status_code)
+
+    threads = [threading.Thread(target=_move, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 两桶令牌守恒（未配全局/租户策略，扣减只发生在两个路由桶之间）：
+    # 初始合计 10 + 10 = 20；源不会扣成负数，目标不会超过容量 20
+    src = _route_bucket(client, "acme", "r-a")["balance"]
+    dst = _route_bucket(client, "acme", "r-b")["balance"]
+    assert src + dst == 20.0
+    assert src >= 0.0 and dst <= 20.0
+    # 源余额 10 只够 2 笔 4（第 3 笔源余额 2 < 4）；目标空间 10 容纳 8 不先成为瓶颈
+    assert results.count(200) == 2
+    assert results.count(409) == 6
+    assert src == 2.0 and dst == 18.0
+
+
+def test_route_transfer_isolated_between_tenants(client):
+    # 两个租户各有同号路由：t1 配置齐全，t2 缺策略；互不影响
+    put_policy(client, "route", 10, 0, tenant="t1", route="r-a")
+    put_policy(client, "route", 10, 0, tenant="t1", route="r-b")
+    put_policy(client, "route", 10, 0, tenant="t2", route="r-a")
+    r = _route_transfer(client, "tr-1", "t2", "r-a", "r-b", 1)
+    assert r.status_code == 404  # t2 的 r-b 未配置，不能借用 t1 的桶
+    # t1 目标桶先腾出空间
+    client.post("/decide", json={
+        "request_id": "d1", "tenant_id": "t1", "route_id": "r-b", "cost": 5})
+    ok = _route_transfer(client, "tr-2", "t1", "r-a", "r-b", 2)
+    assert ok.status_code == 200
+    assert _route_bucket(client, "t1", "r-a")["balance"] == 8.0
+    assert _route_bucket(client, "t1", "r-b")["balance"] == 7.0
