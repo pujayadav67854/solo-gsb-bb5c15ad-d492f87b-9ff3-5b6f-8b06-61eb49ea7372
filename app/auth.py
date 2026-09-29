@@ -5,6 +5,7 @@
   POST   /policies/rollback
   POST   /policy-changes
   DELETE /policy-changes/{change_id}
+  POST   /route-transfers
 
 所有 GET、裁决（POST /decide、POST /decide-batches）、撤销（.../revoke）
 与配额预占（POST /reservations 及其确认/取消/查询）不经过本模块，保持匿名可用。

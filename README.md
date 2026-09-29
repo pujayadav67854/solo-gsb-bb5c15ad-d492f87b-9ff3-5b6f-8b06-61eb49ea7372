@@ -131,16 +131,35 @@
   更小**者优先。返回入选/未入选 ID、总收益与各命中桶扣除入选项后的剩余额；
   无可行项时返回空集。规划**全程只读**（不建桶、不写裁决与事件），结果不保证
   之后的真实裁决准入；接口免认证。
+- **路由桶令牌移拨（POST /route-transfers）**：运营在**同一租户**的两个**不同
+  路由**配额桶之间移拨现有令牌。提交唯一 `transfer_id`、`tenant_id`、源路由、
+  目标路由与正数 `amount`，成功返回移拨时刻、两桶移拨后余额及是否重放。
+  - 仅当源、目标两条**路由策略均已配置**时允许（缺任一侧 **404**）；未创建的
+    桶按各自容量**满额**处理。源/目标路由相同（**422**）、数量非正/NaN/Infinity
+    （**422**）明确报错。
+  - 写路径分两个串行 `BEGIN IMMEDIATE` 事务（与预占结算同一「到期优先」约定）：
+    **独立前序事务**先按现有规则应用源、目标两侧已到期的定时策略切换、把全部
+    到期 pending 预占转为 expired 并返还，再把两桶补充到**同一时刻**并提交；
+    随后的移拨事务完成判足与扣增。因此即使移拨返回冲突，已到期的返还与切换
+    仍已持久化生效。
+  - 源桶补充后余额不足，或目标桶补充后余额加 `amount` 超过容量时返回 **409**，
+    **不执行移拨扣增**（成功时只扣源路由桶、增目标路由桶，不扣全局/租户桶，
+    不写裁决存档，也不产生 `low_balance` 事件）。
+  - 相同 `transfer_id` 与完整载荷（tenant / source / target / amount）重放原
+    成功结果（`replayed=true`，不再次移拨）；编号相同但载荷不同返回 **409**。
+  - 接口为管理写操作，沿用四个既有管理写接口完全相同的 HMAC 签名与 nonce
+    防重放约定；业务失败（422/404/409）回滚不占用 nonce。
 - **并发不超发**：SQLite 处于 WAL 模式，写事务一律 `BEGIN IMMEDIATE` 立即加写锁，
   配合 `busy_timeout=30s` 让并发写者排队，读-改-写序列天然串行化。
   单进程多线程、多进程（多个实例共享同一数据库文件）下均不会超发。
-- **管理写接口 HMAC-SHA256 防重放认证**：仅保护四个管理写接口——
+- **管理写接口 HMAC-SHA256 防重放认证**：仅保护五个管理写接口——
   `PUT /policies`（策略新增/更新）、`POST /policies/rollback`（回滚）、
   `POST /policy-changes`（定时变更创建）、`DELETE /policy-changes/{change_id}`
-  （定时变更取消）。**所有 GET、`POST /decide`、`POST /decide-batches` 裁决、
-`POST /policies/impact-preview` 预演、撤销、预占（`POST /reservations` 及其
-确认/取消/结算/查询）、`POST /quota-plans` 配额规划与 `GET /quota-usage` 消耗
-核对接口保持原样、无需认证**。
+  （定时变更取消）与 `POST /route-transfers`（路由桶令牌移拨）。**所有 GET、
+  `POST /decide`、`POST /decide-batches` 裁决、`POST /policies/impact-preview`
+  预演、撤销、预占（`POST /reservations` 及其确认/取消/结算/查询）、
+  `POST /quota-plans` 配额规划与 `GET /quota-usage` 消耗核对接口保持原样、
+  无需认证**。
   客户端发送 `X-Key-Id`、`X-Timestamp`（Unix 秒）、`X-Nonce`、`X-Signature` 四个头，
   签名原文为 `方法\n原始路径及查询串\n请求体 SHA-256 十六进制\n时间戳\nnonce`，
   签名值为小写十六进制 HMAC-SHA256。服务端用 `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET`
@@ -178,7 +197,7 @@ docker compose up --build -d
 ```
 
 > 若服务端**未配置** `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET`（两者任一为空），
-> 四个管理写接口以 **503** 显式拒绝（fail-closed，绝不放行）；
+> 五个管理写接口以 **503** 显式拒绝（fail-closed，绝不放行）；
 > GET / 裁决 / 撤销接口不受影响。
 
 服务监听 **8000 端口**：
@@ -216,6 +235,7 @@ SQLite 数据文件保存在命名卷 `quota-data`（容器内 `/data/quota.db`�
 | `POST` | `/policies/rollback` |
 | `POST` | `/policy-changes` |
 | `DELETE` | `/policy-changes/{change_id}` |
+| `POST` | `/route-transfers` |
 
 ### 请求头
 
@@ -352,6 +372,7 @@ print(urllib.request.urlopen(req).read().decode())
 | `POST` | `/reservations/{reservation_id}/cancel` | 取消预占：pending→cancelled，同事务向原桶返还 cost（不超过当前容量）；重复取消幂等，已到期先转 expired 再 409 |
 | `POST` | `/reservations/{reservation_id}/settle` | 结算预占：仅未到期 pending→settled，按实际用量 actual_cost 多退少补（少用返还差额并封顶、多用原桶都足够才统一补扣，否则 409 保持 pending 不扣款）；同值重放、异值/其他终态 409、到期优先（先持久化 expired 与返还）、未知 ID 404、负数/NaN 422 |
 | `GET`  | `/reservations/{reservation_id}` | 查询预占状态与到期时间（settled 行含 actual_cost / settled_at）；该预占到期时在同一事务内清理为 expired 并返还 |
+| `POST` 🔐 | `/route-transfers` | 同一租户两个不同路由桶间移拨令牌：前序独立写事务先应用两侧到期切换/返还到期预占/两桶补充到同一时刻（冲突也生效），再只扣源桶、增目标桶；源不足或目标超容量 409 不扣增；transfer_id 对完整载荷幂等重放 |
 | `POST` | `/quota-plans` | 只读规划：为 1～18 个待执行请求选出配额内总收益最大的子集（精确最优，同级并列比项数、再比升序 ID 字典序）；返回入选/未入选 ID、总收益与命中桶剩余额 |
 | `GET`  | `/quota-usage` | 只读消耗核对：按 UTC 左闭右开窗口（裁决时间 / 预占创建时间）在同一只读快照内按 tenant_id、route_id 汇总已消耗量与未完成占用量；不修改预占或桶 |
 | `GET`  | `/events` | 按 id 递增分页查询 low_balance 事件（`after_id` / `limit`） |
@@ -1065,8 +1086,9 @@ curl -s http://localhost:8000/reservations/rsv-001
 >   结算业务事务**之前的独立写事务**并单独提交，因此即使结算因到期（或补扣不足）
 >   返回 409，`expired` 与返还也已持久化；
 > - **所有余额写操作**（`/decide`、`/decide-batches`、`/revoke`、`PUT /policies`、
->   `POST /policies/rollback`、预占确认/取消/结算）动桶前都先完成到期
->   清扫与返还，因此到期转换、返还与随后的读改写原子提交，不会漏还或重复返还；
+>   `POST /policies/rollback`、`POST /route-transfers`、预占确认/取消/结算）动桶前
+>   都先完成到期清扫与返还，因此到期转换、返还与随后的读改写原子提交，不会漏还或
+>   重复返还；
 > - 返还规则与撤销一致：先应用原桶到期的定时切换、按当前策略补充，再加回令牌，
 >   以桶**当前容量**为上限；结算的补扣同样先补充/切换，且只有**所有原桶都足够**时
 >   才统一补扣差额；预占的预扣、返还与补扣都**不产生** low_balance 事件。
@@ -1188,6 +1210,66 @@ curl -s -G 'http://localhost:8000/quota-usage' \
 >   记录计入、恰在 `end` 的不计入；
 > - 查询全程只读，可安全反复调用；接口免认证。
 
+## 路由桶令牌移拨（POST /route-transfers，🔐 管理写接口）
+
+运营把现有令牌从同一租户的一个路由配额桶移拨到另一个路由配额桶时使用
+（例如把低峰路由的额度临时拨给高峰路由）。提交唯一移拨编号 `transfer_id`、
+`tenant_id`、源路由 `source_route_id`、目标路由 `target_route_id` 与正数
+`amount`：
+
+```bash
+# 前置：同租户两条路由策略均已配置（用前文的 admin_curl 签名助手）
+admin_curl PUT /policies '{"scope":"route","tenant_id":"acme","route_id":"/v1/search","capacity":10,"refill_rate":0}'
+admin_curl PUT /policies '{"scope":"route","tenant_id":"acme","route_id":"/v1/feed","capacity":10,"refill_rate":0}'
+
+# 把 /v1/search 桶的 3 个令牌移拨到 /v1/feed 桶
+admin_curl POST /route-transfers '{
+  "transfer_id":"move-20260929-001",
+  "tenant_id":"acme",
+  "source_route_id":"/v1/search",
+  "target_route_id":"/v1/feed",
+  "amount":3
+}'
+```
+
+成功响应（`source` / `target` 给出两桶容量、补充率与**移拨后**余额）：
+
+```json
+{
+  "transfer_id": "move-20260929-001",
+  "tenant_id": "acme",
+  "source_route_id": "/v1/search",
+  "target_route_id": "/v1/feed",
+  "amount": 3.0,
+  "transferred_at": "2026-09-29T08:00:00.000000Z",
+  "replayed": false,
+  "source": {"scope": "route", "tenant_id": "acme", "route_id": "/v1/search", "capacity": 10.0, "refill_rate": 0.0, "balance": 7.0},
+  "target": {"scope": "route", "tenant_id": "acme", "route_id": "/v1/feed",  "capacity": 10.0, "refill_rate": 0.0, "balance": 10.0}
+}
+```
+
+> - **前置条件**：`source_route_id` 与 `target_route_id` 必须是**不同路由**，
+>   且两侧**路由策略均已通过 `PUT /policies` 配置**；相同路由返回 **422**，
+>   缺任一侧策略返回 **404**。未创建的桶按各自容量**满额**处理（移拨成功后
+>   才惰性建桶）。`amount` 必须是有限正数（0、负数、`NaN`、`Infinity` 返回
+>   **422**）。
+> - **同一写事务的维护顺序（到期优先）**：写路径含两个串行写事务——第一个
+>   **独立前序事务**先按现有规则应用源、目标两侧已到期的定时策略切换、把全部
+>   到期 pending 预占转为 expired 并向各自原桶返还，再把源、目标两桶补充到
+>   **同一时刻**并单独提交；第二个事务完成判足与扣增。因此即使随后移拨返回
+>   409，已到期的切换与返还也已生效。
+> - **冲突不扣增**：源桶（补充后）余额不足、或目标桶（补充后）余额加
+>   `amount` 超过容量时返回 **409**，**一个令牌都不扣增**；成功时**只扣源
+>   路由桶、增目标路由桶**——不扣全局/租户桶，不写裁决（`decisions`），
+>   也不产生 `low_balance` 事件。
+> - **幂等重放**：相同 `transfer_id` + 相同完整载荷（tenant / source /
+>   target / amount）直接返回**原成功结果**（`replayed=true`、原移拨时刻与
+>   原余额，不再次移拨）；编号相同但任一载荷字段不同返回 **409**。冲突失败
+>   不存档，可用同一编号在余额恢复后重试。
+> - 接口为管理写操作：必须携带 `X-Key-Id` / `X-Timestamp` / `X-Nonce` /
+>   `X-Signature` 四个头，签名规则见
+>   [管理写接口签名认证](#管理写接口签名认证)；业务失败回滚不占用 nonce。
+
 ## 行为约定与边界
 
 - 桶首次被命中时按当前容量**满额**创建。
@@ -1273,6 +1355,23 @@ curl -s -G 'http://localhost:8000/quota-usage' \
     字典序（小者胜）；`selected_item_ids` / `unselected_item_ids` 均按升序返回；
   - 响应 `buckets` 为本次规划命中的全部桶（含仅被未入选项命中的桶）扣除入选项
     占用后的剩余额；无可行项时 `selected_item_ids` 为空、总收益为 0。
+- 路由桶令牌移拨（`POST /route-transfers`）的额外约定：
+  - 写路径为两个串行写事务：**独立前序事务**先应用源、目标两侧到期的定时切换、
+    全局清扫并返还到期 pending 预占、再把两桶按各自当前策略补充到同一时刻并单独
+    提交（即使移拨随后返回 409 这些效果也持久化）；移拨事务（nonce 与业务写入同
+    事务）再校验两侧策略均存在、判足并扣增；
+  - 只允许同一租户的**两个不同路由**：相同路由 422、缺 `tenant_id`/空路由 422；
+    源或目标路由策略未配置 404；未创建的桶按各自容量满额处理，成功扣增后才
+    惰性建桶；`amount` 必须为有限正数（0/负数/NaN/Infinity 均 422）；
+  - 源桶（补充后）余额不足、或目标桶（补充后）余额 + `amount` 超过目标容量时
+    返回 409 且不扣增（不建桶、不写移拨存档）；成功时只扣源路由桶、增目标路由
+    桶，不扣全局/租户桶，不写 `decisions`，也不产生 `low_balance` 事件；
+  - `transfer_id` 对完整载荷（tenant / source / target / amount）幂等：同键同
+    载荷重放原成功结果（`replayed=true`，返回原移拨时刻与原两桶余额，不再次
+    移拨），同键异载荷 409；失败请求不占用编号，余额恢复后可用同一编号重试；
+  - 接口为第五个 HMAC 管理写接口：四个签名头、300 秒时间窗、nonce 防重放与
+    「业务失败回滚不占 nonce」的约定与其余管理写接口完全一致；`BEGIN IMMEDIATE`
+    串行化保证并发移拨不会把源桶扣成负数。
 
 ## 本地开发（不用 Docker）
 
@@ -1285,7 +1384,7 @@ QUOTA_DB_PATH=./quota.db \
   .venv/bin/uvicorn app.main:app --reload --port 8000
 ```
 
-> 不设置 `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET` 时，四个管理写接口返回 503；
+> 不设置 `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET` 时，五个管理写接口返回 503；
 > GET / 裁决 / 撤销仍可正常使用。
 
 运行测试（另需 `pip install pytest httpx`）：
@@ -1359,18 +1458,28 @@ confirmed 按预占量与 settled 按 actual_cost（含 actual=0）计入消耗�
 按 tenant_id+route_id 分组与全局/租户/路由排序、窗口按裁决/预占创建时间
 左闭右开筛选（含端点边界与 created_at 过滤）、无匹配返回空分组、
 时间格式无效（含不带时区）与起点不早于终点 422、非 UTC 偏移换算、免认证。
+路由桶令牌移拨覆盖：同租户不同路由两桶间成功扣增并返回两桶移拨后余额、
+未建桶按满额处理（源未建扣后惰性建桶、目标满额致超容量冲突不建桶）、
+只扣源桶增目标桶（全局/租户桶不变、不写裁决与 low_balance 事件）、
+源不足与目标超容量 409 且两桶余额不变（失败不存档、同编号可重试）、
+恰好装满容量成功、缺源/目标路由策略 404、相同路由/非正/NaN/Infinity/
+缺 tenant 等 422、同编号同载荷重放原时刻原余额且不再次移拨（含事后余额已变）、
+同编号异载荷（amount/源/目标/租户）409、独立前序事务在冲突时仍持久化
+到期预占返还与两侧到期定时切换、HMAC 签名（无签名/错密钥/时间窗/篡改体 401）、
+业务失败不占 nonce（404/409 后同 nonce 可成功，成功 nonce 重用 409），
+以及 20 线程并发移拨源桶不超扣（成功笔数恰等于源桶令牌数）。
 
 ## 项目结构
 
 ```
 app/
   auth.py       # 管理写接口 HMAC-SHA256 防重放：签名校验（常量时间比较）、时间窗与 nonce 登记
-  database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 写事务 / 只读快照事务、建表（含 admin_nonces、decide_batches、reservations[actual_cost/settled_at/settled]）与老库迁移（baseline 版本补登、老 reservations 表就地重建升级）
-  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、策略影响预演（只读快照+现行/候选双侧内存演算）、配额预占（统一预扣/原桶快照/确认/取消/结算多退少补/到期惰性清扫返还）、配额规划（只读快照+分支限界精确最优子集）、配额消耗核对（只读快照按窗口/租户/路由汇总消耗与占用）、幂等存档、撤销与低余额事件
-  schemas.py    # Pydantic 请求/响应模型（含批量裁决、影响预演、配额预占[结算]、配额规划与配额消耗核对）
-  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches、POST /policies/impact-preview、/reservations 预占五接口[含 settle]、POST /quota-plans 与 GET /quota-usage）
+  database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 写事务 / 只读快照事务、建表（含 admin_nonces、decide_batches、reservations[actual_cost/settled_at/settled]、route_transfers）与老库迁移（baseline 版本补登、老 reservations 表就地重建升级）
+  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、策略影响预演（只读快照+现行/候选双侧内存演算）、配额预占（统一预扣/原桶快照/确认/取消/结算多退少补/到期惰性清扫返还）、路由桶令牌移拨（前序独立维护事务+只扣源桶增目标桶+transfer_id 幂等）、配额规划（只读快照+分支限界精确最优子集）、配额消耗核对（只读快照按窗口/租户/路由汇总消耗与占用）、幂等存档、撤销与低余额事件
+  schemas.py    # Pydantic 请求/响应模型（含批量裁决、影响预演、配额预占[结算]、路由桶令牌移拨、配额规划与配额消耗核对）
+  main.py       # FastAPI 路由（5 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches、POST /policies/impact-preview、/reservations 预占五接口[含 settle]、POST /route-transfers、POST /quota-plans 与 GET /quota-usage）
 tests/
-  test_api.py   # 行为、并发与 HMAC 认证测试（含批量裁决、策略影响预演、配额预占、配额规划与配额消耗核对）
+  test_api.py   # 行为、并发与 HMAC 认证测试（含批量裁决、策略影响预演、配额预占、路由桶令牌移拨、配额规划与配额消耗核对）
 Dockerfile
 docker-compose.yml
 ```

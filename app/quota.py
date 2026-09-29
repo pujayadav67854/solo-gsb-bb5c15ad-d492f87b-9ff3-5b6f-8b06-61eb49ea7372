@@ -2555,6 +2555,257 @@ def settle_reservation(
     return _reservation_out(conn, row, replayed=False, now=ts)
 
 
+# ------------------------------------------------------- 路由桶令牌移拨（route transfer）
+
+
+_TRANSFER_COLS = (
+    "transfer_id, payload_hash, payload_json, tenant_id, source_route_id, "
+    "target_route_id, amount, transferred_at, result_json"
+)
+
+
+def _route_key(tenant: str, route: str) -> tuple[str, str, str]:
+    return ("route", tenant, route)
+
+
+def prepare_route_transfer(
+    conn: sqlite3.Connection,
+    tenant_id: str,
+    source_route_id: str,
+    target_route_id: str,
+    now: Optional[datetime] = None,
+) -> datetime:
+    """移拨业务事务前的独立维护事务（始终提交，到期优先）：
+
+      1. 应用源、目标**两侧**已到期（effective_at <= now）的定时策略切换
+         （沿用现有到期应用规则）；
+      2. 按「所有余额写操作」的现有规则把**全部**到期 pending 预占转为
+         expired 并向各自原桶返还；
+      3. 把源、目标两桶按各自当前策略补充到**同一时刻** now 并落库
+         （未创建的桶不建——移拨随后按满额处理）。
+
+    与结算接口的前序清扫同一约定：即使随后的移拨因余额不足/目标桶容量不足
+    返回 409 而整体回滚，已到期的切换、到期预占返还与两桶的时间补充也已
+    持久化。返回本次使用的事务时刻，供紧随其后的移拨事务复用（边界一致）。
+    """
+    ts = now or now_utc()
+    now_iso = iso(ts)
+    keys = [
+        _route_key(tenant_id, source_route_id),
+        _route_key(tenant_id, target_route_id),
+    ]
+    # 1) 两侧已到期的定时策略切换在本事务内应用（无后台任务，惰性驱动）
+    _apply_due_changes(conn, keys, ts)
+    # 2) 所有余额写操作：全局清扫到期 pending 预占并向各自原桶返还
+    _expire_due_reservations(conn, ts)
+    # 3) 两桶按各自当前策略补充到同一时刻并落库（未建桶不建）
+    for scope, tenant, route in keys:
+        pol = conn.execute(
+            "SELECT capacity, refill_rate FROM policies "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (scope, tenant, route),
+        ).fetchone()
+        if pol is None:
+            continue  # 策略缺失留给业务事务返回 404
+        b = conn.execute(
+            "SELECT balance, updated_at FROM buckets "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (scope, tenant, route),
+        ).fetchone()
+        if b is None:
+            continue  # 未创建的桶随后按满额处理
+        balance = _refill(
+            b["balance"], b["updated_at"],
+            pol["capacity"], pol["refill_rate"], ts,
+        )
+        conn.execute(
+            "UPDATE buckets SET balance=?, updated_at=? "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (balance, now_iso, scope, tenant, route),
+        )
+    return ts
+
+
+def _transfer_bucket_out(
+    tenant: str, route: str, cap: float, rate: float, balance: float
+) -> dict[str, Any]:
+    return {
+        "scope": "route",
+        "tenant_id": tenant or None,
+        "route_id": route or None,
+        "capacity": float(cap),
+        "refill_rate": float(rate),
+        "balance": float(balance),
+    }
+
+
+def route_transfer(
+    conn: sqlite3.Connection,
+    *,
+    transfer_id: str,
+    tenant_id: str,
+    source_route_id: str,
+    target_route_id: str,
+    amount: float,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """在同一租户的两个不同路由配额桶之间移拨现有令牌（调用方须持有写事务）。
+
+    调用约定：到达本函数前，路由层已在**独立的前序写事务**中完成
+    prepare_route_transfer 并提交（到期切换应用、到期预占返还、
+    两桶补充到同一时刻——即使本函数返回 409 这些效果也已持久化）。
+
+    仅源、目标两条**路由策略均已配置**时允许（缺任一侧 404）；未创建的桶
+    按各自容量满额处理。源桶补充后余额不足，或目标桶补充后余额加移拨量
+    超过容量时返回 409，不执行任何扣增（成功时只扣源桶、增目标桶；
+    不扣全局/租户桶，不写裁决，不产生 low_balance 事件）。
+
+    幂等：相同 transfer_id + 相同载荷（tenant/source/target/amount）直接
+    返回原成功结果（replayed=true，不再次移拨）；相同 transfer_id 异载荷
+    返回 409。
+    """
+    if not math.isfinite(float(amount)) or float(amount) <= 0.0:
+        raise HTTPException(422, "amount 必须是有限正数")
+
+    ts = now or now_utc()
+    now_iso = iso(ts)
+    payload = {
+        "tenant_id": tenant_id,
+        "source_route_id": source_route_id,
+        "target_route_id": target_route_id,
+        "amount": float(amount),
+    }
+    digest = payload_hash(payload)
+
+    # 幂等判定先于策略存在性校验（与裁决/预占的重放顺序一致）
+    existing = conn.execute(
+        f"SELECT {_TRANSFER_COLS} FROM route_transfers WHERE transfer_id=?",
+        (transfer_id,),
+    ).fetchone()
+    if existing is not None:
+        if existing["payload_hash"] != digest:
+            raise HTTPException(
+                409,
+                f"transfer_id={transfer_id!r} 已存在但移拨载荷不一致，拒绝重放",
+            )
+        result = json.loads(existing["result_json"])
+        result["replayed"] = True
+        return result
+
+    src_key = _route_key(tenant_id, source_route_id)
+    dst_key = _route_key(tenant_id, target_route_id)
+
+    def _load_route_bucket(
+        key: tuple[str, str, str], label: str
+    ) -> tuple[sqlite3.Row, float, bool]:
+        """返回 (策略行, 补充到 now 后的余额, 桶是否为本次新建)。策略缺失 404。"""
+        pol = conn.execute(
+            "SELECT capacity, refill_rate FROM policies "
+            "WHERE scope='route' AND tenant_id=? AND route_id=?",
+            (key[1], key[2]),
+        ).fetchone()
+        if pol is None:
+            raise HTTPException(
+                404,
+                f"{label}路由策略不存在：tenant_id={tenant_id!r} "
+                f"route_id={key[2]!r}，请先用 PUT /policies 配置",
+            )
+        row = conn.execute(
+            "SELECT balance, updated_at FROM buckets "
+            "WHERE scope='route' AND tenant_id=? AND route_id=?",
+            (key[1], key[2]),
+        ).fetchone()
+        if row is None:
+            # 未创建的桶按各自容量满额处理（惰性建桶）
+            return pol, float(pol["capacity"]), True
+        balance = _refill(
+            row["balance"], row["updated_at"],
+            pol["capacity"], pol["refill_rate"], ts,
+        )
+        return pol, balance, False
+
+    src_pol, src_balance, src_new = _load_route_bucket(src_key, "源")
+    dst_pol, dst_balance, dst_new = _load_route_bucket(dst_key, "目标")
+
+    amount = float(amount)
+    src_cap = float(src_pol["capacity"])
+    dst_cap = float(dst_pol["capacity"])
+
+    # 源不足 / 目标超容量：冲突，一个令牌都不扣增（前序事务的补充与到期
+    # 处理已提交；本事务仅回滚可能的桶行与移拨存档）
+    if src_balance + 1e-12 < amount:
+        raise HTTPException(
+            409,
+            f"源路由桶余额不足：tenant_id={tenant_id!r} route_id={source_route_id!r} "
+            f"补充后余额 {src_balance:g}，需要移拨 {amount:g}，不移拨任何令牌",
+        )
+    if dst_balance + amount > dst_cap + 1e-12:
+        raise HTTPException(
+            409,
+            f"目标路由桶容量不足：tenant_id={tenant_id!r} route_id={target_route_id!r} "
+            f"补充后余额 {dst_balance:g} + 移拨 {amount:g} 超过容量 {dst_cap:g}，"
+            "不移拨任何令牌",
+        )
+
+    src_after = src_balance - amount
+    dst_after = min(dst_cap, dst_balance + amount)
+
+    if src_new:
+        conn.execute(
+            "INSERT INTO buckets (scope, tenant_id, route_id, balance, updated_at) "
+            "VALUES ('route', ?, ?, ?, ?)",
+            (tenant_id, source_route_id, src_after, now_iso),
+        )
+    else:
+        conn.execute(
+            "UPDATE buckets SET balance=?, updated_at=? "
+            "WHERE scope='route' AND tenant_id=? AND route_id=?",
+            (src_after, now_iso, tenant_id, source_route_id),
+        )
+    if dst_new:
+        conn.execute(
+            "INSERT INTO buckets (scope, tenant_id, route_id, balance, updated_at) "
+            "VALUES ('route', ?, ?, ?, ?)",
+            (tenant_id, target_route_id, dst_after, now_iso),
+        )
+    else:
+        conn.execute(
+            "UPDATE buckets SET balance=?, updated_at=? "
+            "WHERE scope='route' AND tenant_id=? AND route_id=?",
+            (dst_after, now_iso, tenant_id, target_route_id),
+        )
+
+    result = {
+        "transfer_id": transfer_id,
+        "tenant_id": tenant_id,
+        "source_route_id": source_route_id,
+        "target_route_id": target_route_id,
+        "amount": amount,
+        "transferred_at": now_iso,
+        "replayed": False,
+        "source": _transfer_bucket_out(
+            tenant_id, source_route_id, src_cap, src_pol["refill_rate"], src_after
+        ),
+        "target": _transfer_bucket_out(
+            tenant_id, target_route_id, dst_cap, dst_pol["refill_rate"], dst_after
+        ),
+    }
+    conn.execute(
+        """
+        INSERT INTO route_transfers
+            (transfer_id, payload_hash, payload_json, tenant_id, source_route_id,
+             target_route_id, amount, transferred_at, result_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            transfer_id, digest, json.dumps(payload, ensure_ascii=False),
+            tenant_id, source_route_id, target_route_id, amount, now_iso,
+            json.dumps(result, ensure_ascii=False),
+        ),
+    )
+    return result
+
+
 # ------------------------------------------------------------ 配额消耗核对（只读）
 
 

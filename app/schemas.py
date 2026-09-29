@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from __future__ import annotations
-
 import math
 from datetime import datetime, timezone
 from typing import Literal, Optional
@@ -319,6 +317,59 @@ class ReservationOut(BaseModel):
     buckets: list[BucketOut] = Field(
         ..., description="原命中桶按当前策略补充后的实时余额（只读快照）"
     )
+
+
+class RouteTransferIn(BaseModel):
+    transfer_id: str = Field(
+        ..., min_length=1,
+        description="移拨唯一编号：相同编号 + 相同载荷重放原成功结果；编号相同载荷不同返回 409",
+    )
+    tenant_id: str = Field(..., min_length=1, description="租户 ID；源/目标路由必须同属该租户")
+    source_route_id: str = Field(..., min_length=1, description="源路由 ID（扣出令牌的路由桶）")
+    target_route_id: str = Field(..., min_length=1, description="目标路由 ID（接收令牌的路由桶）")
+    amount: float = Field(..., description="移拨令牌数：必须为有限正数")
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _amount_finite_positive(cls, v):
+        # gt=0 无法拒绝 NaN（NaN 比较恒为假）；非有限浮点在此显式拒绝为 422。
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("amount 必须是数字")
+        f = float(v)
+        if not math.isfinite(f):
+            raise ValueError("amount 必须是有限数（不接受 NaN / Infinity）")
+        if f <= 0:
+            raise ValueError("amount 必须为正数")
+        return f
+
+    @field_validator("target_route_id")
+    @classmethod
+    def _routes_must_differ(cls, v, info):
+        src = info.data.get("source_route_id")
+        if src is not None and v == src:
+            raise ValueError("source_route_id 与 target_route_id 必须是不同的路由")
+        return v
+
+
+class RouteTransferBucketOut(BaseModel):
+    scope: str
+    tenant_id: Optional[str]
+    route_id: Optional[str]
+    capacity: float
+    refill_rate: float
+    balance: float = Field(..., description="移拨后的桶余额（已按当前策略补充并扣/增移拨量）")
+
+
+class RouteTransferOut(BaseModel):
+    transfer_id: str
+    tenant_id: str
+    source_route_id: str
+    target_route_id: str
+    amount: float
+    transferred_at: str = Field(..., description="移拨时刻（ISO 8601 UTC）")
+    replayed: bool = False
+    source: RouteTransferBucketOut = Field(..., description="源路由桶移拨后余额")
+    target: RouteTransferBucketOut = Field(..., description="目标路由桶移拨后余额")
 
 
 class QuotaPlanItemIn(BaseModel):

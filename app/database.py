@@ -188,8 +188,25 @@ CREATE INDEX IF NOT EXISTS idx_reservations_due
 ON reservations (expire_at)
 WHERE status = 'pending';
 
+-- 路由桶令牌移拨（route transfer）：运营在同一租户的两个不同路由桶之间移拨
+-- 现有令牌。只扣源路由桶、增目标路由桶，不触碰全局/租户桶，不产生裁决与
+-- low_balance 事件。按 transfer_id + 完整载荷（tenant/source/target/amount）
+-- 幂等：同键同载荷重放原成功结果，同键异载荷返回 409。
+CREATE TABLE IF NOT EXISTS route_transfers (
+    transfer_id     TEXT PRIMARY KEY,
+    payload_hash    TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    tenant_id       TEXT NOT NULL DEFAULT '',
+    source_route_id TEXT NOT NULL,
+    target_route_id TEXT NOT NULL,
+    amount          REAL NOT NULL CHECK (amount > 0),
+    transferred_at  TEXT NOT NULL,
+    result_json     TEXT NOT NULL
+) STRICT;
+
 -- 管理写接口（PUT /policies、POST /policies/rollback、
--- POST /policy-changes、DELETE /policy-changes/{id}）的 HMAC 防重放 nonce。
+-- POST /policy-changes、DELETE /policy-changes/{id}、
+-- POST /route-transfers）的 HMAC 防重放 nonce。
 -- 与 key_id 联合唯一：同一 key 在保留窗口（expires_at，300 秒）内重用 -> 409；
 -- 过期行在每次认证写入前于同一事务内清理。登记必须与业务写入同事务提交，
 -- 业务失败回滚时 nonce 行一并撤销（见 app/auth.py reserve_nonce）。
